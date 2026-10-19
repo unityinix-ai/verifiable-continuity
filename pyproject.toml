@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verifiable-continuity"
+version = "0.1.0"
+description = "Verifiable data continuity across distributed environments: local-first event logs, vector clocks, JSON Patch deltas, SHA-256 hash chains."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Alexander Leonard", email = "unityinix@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/unityinix-ai/verifiable-continuity"
+
+[tool.setuptools.packages.find]
+include = ["verifiable_continuity*"]

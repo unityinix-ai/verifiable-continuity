@@ -76,7 +76,11 @@ class Node:
         self.clock = VectorClock()
         self.state = {}
         # _rebuild verifies the complete persisted log before replaying it.
-        self._rebuild()
+        try:
+            self._rebuild()
+        except Exception:
+            self.log.close()
+            raise
 
     # -- local writes ----------------------------------------------------
 
@@ -85,6 +89,9 @@ class Node:
 
         Returns the event's SHA-256 hash.
         """
+        # Recheck persisted history in case another writer changed the DB
+        # while this Node instance was alive.
+        _assert_log_integrity(self.log.all_events(), context="update rejected")
         # Validate the patch against current state before committing anything.
         new_state = apply_patch(self.state, ops)
         self.clock = self.clock.tick(self.node_id)

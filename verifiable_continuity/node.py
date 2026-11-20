@@ -7,9 +7,8 @@ A node owns:
   - a per-node SHA-256 hash chain over its own events.
 
 Sync merges event sets with a peer and replays both in one deterministic
-causal order, so all nodes converge on identical state. Because the log is
-the source of truth, a node restarted from its database file restores the
-exact session it had -- offline, with zero data loss.
+causal order, so all nodes converge on identical state. Integrity is checked
+before imported events are committed and before any persisted state is replayed.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from .vector_clock import VectorClock
 
 
 class TamperError(Exception):
-    """Raised when an event fails integrity checks during import or verify."""
+    """Raised when an event fails integrity checks during import or restore."""
 
 
 def _causal_order(events: list[dict]) -> list[dict]:
@@ -54,6 +53,20 @@ def _causal_order(events: list[dict]) -> list[dict]:
     return sorted(events, key=cmp_to_key(cmp))
 
 
+def _assert_log_integrity(events: list[dict], *, context: str) -> None:
+    """Fail closed unless every per-node chain in the candidate log verifies."""
+    try:
+        ok, where = verify_chain(events)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TamperError(f"{context}: malformed event record") from exc
+    if not ok:
+        node_id, node_seq = where
+        raise TamperError(
+            f"{context}: hash chain broken at node={node_id!r} "
+            f"seq={node_seq}; no state was accepted"
+        )
+
+
 class Node:
     """One participant in the continuity fabric."""
 
@@ -62,6 +75,7 @@ class Node:
         self.log = EventLog(db_path)
         self.clock = VectorClock()
         self.state = {}
+        # _rebuild verifies the complete persisted log before replaying it.
         self._rebuild()
 
     # -- local writes ----------------------------------------------------
@@ -95,27 +109,66 @@ class Node:
         return self.log.all_events()
 
     def import_events(self, events: list[dict]) -> int:
-        """Merge foreign events after integrity checks. Returns count added."""
-        added = 0
-        for e in events:
-            if self.log.has(e["node_id"], e["node_seq"]):
+        """Atomically merge foreign events after full-chain validation.
+
+        Existing sequence keys must match byte-for-byte at the decoded event
+        level. Conflicting duplicates are rejected rather than silently
+        ignored. The complete candidate log is verified before any insert.
+        """
+        existing = self.log.all_events()
+        existing_by_key = {
+            (e["node_id"], e["node_seq"]): e for e in existing
+        }
+        new_events = []
+        seen_in_batch = {}
+
+        for event in events:
+            try:
+                key = (event["node_id"], event["node_seq"])
+            except (KeyError, TypeError) as exc:
+                raise TamperError("import rejected: malformed event identity") from exc
+
+            if key in seen_in_batch:
+                if seen_in_batch[key] != event:
+                    raise TamperError(
+                        f"import rejected: conflicting duplicate {key!r}"
+                    )
                 continue
-            self._check_event(e)
-            self.log.append(
-                node_id=e["node_id"], node_seq=e["node_seq"],
-                clock=e["clock"], ops=e["ops"],
-                prev_hash=e["prev_hash"], hash=e["hash"], ts=e["ts"],
+            seen_in_batch[key] = event
+
+            if key in existing_by_key:
+                if existing_by_key[key] != event:
+                    raise TamperError(
+                        f"import rejected: conflicting existing event {key!r}"
+                    )
+                continue
+            new_events.append(event)
+
+        candidate = existing + new_events
+        _assert_log_integrity(candidate, context="import rejected")
+
+        inserted = self.log.append_many(new_events)
+        if inserted != len(new_events):
+            # This should only occur if another writer raced this node. Do not
+            # replay; force the caller to reopen and inspect the persisted log.
+            raise TamperError(
+                "import interrupted by a concurrent database writer; "
+                "reopen and verify the log before continuing"
             )
-            added += 1
-        if added:
+
+        if new_events:
             self._rebuild()
-        return added
+        return inserted
 
     def _check_event(self, e: dict) -> None:
-        recomputed = compute_hash(
-            node_id=e["node_id"], node_seq=e["node_seq"], clock=e["clock"],
-            ops=e["ops"], prev_hash=e["prev_hash"], ts=e["ts"],
-        )
+        """Check one event's self-hash; full chain checks happen at batch level."""
+        try:
+            recomputed = compute_hash(
+                node_id=e["node_id"], node_seq=e["node_seq"], clock=e["clock"],
+                ops=e["ops"], prev_hash=e["prev_hash"], ts=e["ts"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TamperError("malformed event record") from exc
         if recomputed != e["hash"]:
             raise TamperError(
                 f"event from node {e['node_id']!r} seq {e['node_seq']} "
@@ -130,31 +183,30 @@ class Node:
     # -- verify / reconstruct --------------------------------------------
 
     def verify(self) -> tuple[bool, tuple | None]:
-        """Verify the hash chains of the local log.
-
-        Returns (True, None) when intact, else (False, (node_id, seq))
-        of the first broken link.
-        """
+        """Verify the hash chains of the local log."""
         return verify_chain(self.log.all_events())
 
     def assert_verified(self) -> None:
         assert_chain(self.log.all_events())
 
     def _rebuild(self) -> None:
-        """Reconstruct clock and state by replaying the log in causal order."""
+        """Verify first, then reconstruct clock and state from the event log."""
         events = self.log.all_events()
+        _assert_log_integrity(events, context="restore rejected")
+
         clock = VectorClock()
-        for e in events:
-            clock = clock.merge(VectorClock.from_dict(e["clock"]))
+        for event in events:
+            clock = clock.merge(VectorClock.from_dict(event["clock"]))
         self.clock = clock
+
         state = {}
-        for e in _causal_order(events):
-            state = apply_patch(state, e["ops"])
+        for event in _causal_order(events):
+            state = apply_patch(state, event["ops"])
         self.state = state
 
     @classmethod
     def restore(cls, node_id: str, db_path: str) -> "Node":
-        """Offline session restore: reopen a persisted log, replay it exactly."""
+        """Offline restore; corrupted logs raise TamperError before replay."""
         return cls(node_id, db_path)
 
     def close(self) -> None:

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from verifiable_continuity import Node, TamperError
+from verifiable_continuity.hash_chain import GENESIS_HASH, compute_hash
 
 
 class NodeTestCase(unittest.TestCase):
@@ -56,7 +57,6 @@ class TestSync(NodeTestCase):
         b = self.make_node("b")
         a.update([{"op": "add", "path": "/from_a", "value": 1}])
         b.update([{"op": "add", "path": "/from_b", "value": 2}])
-        # Before sync they disagree.
         self.assertNotEqual(a.state, b.state)
         a.sync_with(b)
         self.assertEqual(a.state, b.state)
@@ -66,7 +66,7 @@ class TestSync(NodeTestCase):
         a = self.make_node("a")
         b = self.make_node("b")
         a.update([{"op": "add", "path": "/doc", "value": {"title": "draft"}}])
-        a.sync_with(b)  # b now causally follows a's write
+        a.sync_with(b)
         b.update([{"op": "replace", "path": "/doc/title", "value": "final"}])
         a.sync_with(b)
         self.assertEqual(a.state["doc"]["title"], "final")
@@ -100,7 +100,6 @@ class TestSync(NodeTestCase):
         a.update([{"op": "add", "path": "/v", "value": 1}])
         a.update([{"op": "replace", "path": "/v", "value": 2}])
         a.update([{"op": "replace", "path": "/v", "value": 3}])
-        # b was offline for all three; one sync brings it fully current.
         b.sync_with(a)
         self.assertEqual(b.state, {"v": 3})
         ok, _ = b.verify()
@@ -117,13 +116,11 @@ class TestOfflineRestore(NodeTestCase):
         expected = dict(n1.state)
         n1.close()
 
-        # Simulate a restart with no network: reopen the same file.
         n2 = Node.restore("solo", db)
         self.nodes.append(n2)
         self.assertEqual(n2.state, expected)
         ok, _ = n2.verify()
         self.assertTrue(ok)
-        # And the restored node can keep writing on the same chain.
         n2.update([{"op": "replace", "path": "/session/step", "value": 3}])
         self.assertEqual(n2.state["session"]["step"], 3)
         ok, _ = n2.verify()
@@ -140,24 +137,20 @@ class TestTamperDetection(NodeTestCase):
         conn.commit()
         conn.close()
 
-    def test_tampered_log_detected_on_verify(self):
+    def test_tampered_log_rejected_before_restore_replay(self):
         db = os.path.join(self.tmp.name, "v.db")
         v = Node("v", db)
         v.update([{"op": "add", "path": "/balance", "value": 100}])
         v.update([{"op": "add", "path": "/owner", "value": "alex"}])
         v.close()
 
-        self._tamper_db(db, 1, '[{"op": "add", "path": "/balance", "value": 999999}]')
+        self._tamper_db(
+            db, 1,
+            '[{"op": "add", "path": "/balance", "value": 999999}]',
+        )
 
-        v2 = Node.restore("v", db)
-        self.nodes.append(v2)
-        ok, where = v2.verify()
-        self.assertFalse(ok)
-        self.assertEqual(where, ("v", 1))
         with self.assertRaises(TamperError):
-            # importing the tampered log into a clean node is rejected
-            clean = self.make_node("clean")
-            clean.import_events(v2.export_events())
+            Node.restore("v", db)
 
     def test_import_rejects_forged_event(self):
         a = self.make_node("a")
@@ -168,6 +161,45 @@ class TestTamperDetection(NodeTestCase):
         with self.assertRaises(TamperError):
             b.import_events([forged])
         self.assertEqual(b.state, {})
+        self.assertEqual(b.export_events(), [])
+
+    def test_import_rejects_broken_batch_chain_without_partial_commit(self):
+        source = self.make_node("source")
+        target = self.make_node("target")
+        source.update([{"op": "add", "path": "/one", "value": 1}])
+        source.update([{"op": "add", "path": "/two", "value": 2}])
+        batch = source.export_events()
+
+        # Forge a self-consistent second event whose predecessor link is wrong.
+        broken = dict(batch[1])
+        broken["prev_hash"] = GENESIS_HASH
+        broken["hash"] = compute_hash(
+            node_id=broken["node_id"],
+            node_seq=broken["node_seq"],
+            clock=broken["clock"],
+            ops=broken["ops"],
+            prev_hash=broken["prev_hash"],
+            ts=broken["ts"],
+        )
+        batch[1] = broken
+
+        with self.assertRaises(TamperError):
+            target.import_events(batch)
+        self.assertEqual(target.export_events(), [])
+        self.assertEqual(target.state, {})
+
+    def test_conflicting_duplicate_is_rejected(self):
+        source = self.make_node("source")
+        target = self.make_node("target")
+        source.update([{"op": "add", "path": "/value", "value": 1}])
+        event = source.export_events()[0]
+        target.import_events([event])
+
+        conflict = dict(event)
+        conflict["ops"] = [{"op": "add", "path": "/value", "value": 2}]
+        with self.assertRaises(TamperError):
+            target.import_events([conflict])
+        self.assertEqual(target.state, {"value": 1})
 
 
 if __name__ == "__main__":
